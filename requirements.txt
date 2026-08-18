@@ -1,0 +1,11 @@
+streamlit>=1.40
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.4
+matplotlib>=3.8
+seaborn>=0.13
+torch>=2.2
+transformers>=4.46
+datasets>=2.19
+accelerate>=0.30
+
