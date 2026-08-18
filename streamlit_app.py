@@ -129,7 +129,8 @@ def train_bert(df: pd.DataFrame, epochs: int, batch_size: int):
         per_device_eval_batch_size=batch_size,
         num_train_epochs=epochs,
         weight_decay=0.01,
-        warmup_ratio=0.1,
+        # Use warmup_steps for compatibility across Transformers versions.
+        warmup_steps=0,
         fp16=torch.cuda.is_available(),
         report_to="none",
         seed=seed,
@@ -295,4 +296,3 @@ if "bert_results" in st.session_state:
                     {"Sentiment": LABEL_NAMES, "Probability": probabilities}
                 )
                 st.dataframe(probability_table, use_container_width=True)
-
