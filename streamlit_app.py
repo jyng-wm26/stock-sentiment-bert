@@ -3,753 +3,2157 @@
 Run this application from PowerShell with:
 
     python -m streamlit run streamlit_app.py
-
-The program performs these main tasks:
-1. Reads an uploaded CSV using several possible text encodings.
-2. Cleans missing, invalid, duplicate, and conflicting records.
-3. Splits the clean data into training, validation, and testing sets.
-4. Balances only the training set using hybrid under/oversampling.
-5. Fine-tunes BERT and displays evaluation results.
-6. Predicts the sentiment of a new financial sentence.
 """
+# ============================================================
+# STOCK SENTIMENT ANALYSIS DASHBOARD
+# ============================================================
+#
+# Models:
+# 1. SVM + TF-IDF
+# 2. Bidirectional LSTM (BiLSTM)
+# 3. BERT
+#
+# Dataset distribution:
+# Positive = 40%, Negative = 30%, Neutral = 30%
+#
+# Evaluation:
+# - Accuracy, Precision, Recall, F1-Score, Classification Report, Confusion Matrix, Training Time
+#
+# Early Stopping:
+# - SVM: Not applicable
+# - BiLSTM: Monitor validation loss
+# - BERT: Monitor validation Macro F1
 
+# ============================================================
+# PART 1: IMPORT LIBRARIES
+# ============================================================
 
-# =============================================================================
-# PART 1: IMPORT THE REQUIRED LIBRARIES
-# =============================================================================
-
-import hashlib
-import inspect
-import tempfile
-
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
+# Streamlit is used to create the dashboard
 import streamlit as st
+
+# Pandas is used to load and manage dataset
+import pandas as pd
+
+# NumPy is used for numerical calculations
+import numpy as np
+
+# Matplotlib is used to display graphs
+import matplotlib.pyplot as plt
+
+# Used to calculate model training time
+import time
+
+# PyTorch is required for BERT
 import torch
-from datasets import Dataset
+
+# ============================================================
+# SCIKIT-LEARN LIBRARIES
+# ============================================================
+
+# Split dataset into training and testing data
+from sklearn.model_selection import train_test_split
+
+# Convert text into TF-IDF numerical features
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# Support Vector Machine
+from sklearn.svm import LinearSVC
+
+# Convert sentiment labels to numerical labels
+from sklearn.preprocessing import LabelEncoder
+
+# Evaluation metrics
 from sklearn.metrics import (
-    ConfusionMatrixDisplay,
     accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
     classification_report,
     confusion_matrix,
-    precision_recall_fscore_support,
+    ConfusionMatrixDisplay
 )
-from sklearn.model_selection import train_test_split
+
+# ============================================================
+# TENSORFLOW / KERAS LIBRARIES FOR BiLSTM
+# ============================================================
+
+# Convert words into integer sequences
+from tensorflow.keras.preprocessing.text import Tokenizer
+
+# Make all sequences the same length
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+# Sequential neural network
+from tensorflow.keras.models import Sequential
+
+# Neural network layers
+from tensorflow.keras.layers import (
+    Embedding,
+    LSTM,
+    Bidirectional,
+    Dense,
+    Dropout
+)
+
+# Stop neural-network training when validation performance
+# stops improving
+from tensorflow.keras.callbacks import EarlyStopping
+
+# ============================================================
+# HUGGING FACE / BERT LIBRARIES
+# ============================================================
+
 from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    DataCollatorWithPadding,
-    Trainer,
+    BertTokenizerFast,
+    BertForSequenceClassification,
     TrainingArguments,
-    set_seed,
+    Trainer,
+    EarlyStoppingCallback
 )
 
+# ============================================================
+# PART 2: STREAMLIT PAGE CONFIGURATION
+# ============================================================
 
-# =============================================================================
-# PART 2: DEFINE THE MODEL AND SENTIMENT LABELS
-# =============================================================================
+st.set_page_config(
+    page_title="Stock Sentiment Model Comparison",
+    page_icon="📈",
+    layout="wide"
+)
 
-# Keep one fixed mapping throughout cleaning, training, evaluation, and prediction.
-LABEL2ID = {"negative": 0, "positive": 1, "neutral": 2}
-ID2LABEL = {0: "negative", 1: "positive", 2: "neutral"}
-LABEL_NAMES = ["negative", "positive", "neutral"]
+st.title("📈 Stock Sentiment Analysis Dashboard")
 
-# This is the standard uncased English BERT model from Hugging Face.
-MODEL_NAME = "google-bert/bert-base-uncased"
+st.write(
+    """
+    This dashboard compares three sentiment classification models:
 
-# A fixed seed makes splitting, balancing, and training more reproducible.
-RANDOM_SEED = 42
+    **SVM + TF-IDF vs BiLSTM vs BERT**
 
+    The models are evaluated using the same balanced stock sentiment
+    dataset and the same final test set.
+    """
+)
 
-# =============================================================================
-# PART 3: READ THE CSV WITH ENCODING FALLBACK
-# =============================================================================
+# ============================================================
+# PART 3: SIDEBAR SETTINGS AND MODEL EXPLANATION
+# ============================================================
 
-def read_csv_with_fallback(uploaded_file):
-    """Read a CSV by trying common encodings used by the project dataset."""
+with st.sidebar:
 
-    # datav1.csv uses CP1252, while other uploaded files may use UTF-8.
-    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
-    last_error = None
+    st.header("⚙️ Training Settings")
 
-    for encoding in encodings:
-        try:
-            # Reset the uploaded file before every reading attempt.
-            uploaded_file.seek(0)
-            dataframe = pd.read_csv(uploaded_file, encoding=encoding)
-            return dataframe, encoding
-        except UnicodeDecodeError as error:
-            last_error = error
+    # --------------------------------------------------------
+    # BiLSTM maximum epochs
+    # --------------------------------------------------------
 
-    raise ValueError(
-        "The CSV could not be read using UTF-8, CP1252, or Latin-1 encoding."
-    ) from last_error
-
-
-# =============================================================================
-# PART 4: CLEAN AND VALIDATE THE DATASET
-# =============================================================================
-
-def clean_data(uploaded_file):
-    """Clean the stock sentiment dataset and return cleaning information."""
-
-    df, detected_encoding = read_csv_with_fallback(uploaded_file)
-    raw_row_count = len(df)
-
-    # The application needs these exact two source columns.
-    required_columns = {"Sentence", "Sentiment"}
-    missing_columns = required_columns.difference(df.columns)
-
-    if missing_columns:
-        raise ValueError(
-            "Missing required columns: "
-            + ", ".join(sorted(missing_columns))
-        )
-
-    # Keep only the columns needed by the model.
-    df = df[["Sentence", "Sentiment"]].copy()
-
-    # Count and remove records with a missing sentence or sentiment label.
-    missing_mask = df["Sentence"].isna() | df["Sentiment"].isna()
-    missing_removed = int(missing_mask.sum())
-    df = df[~missing_mask].copy()
-
-    # Remove extra spaces and standardise label capitalisation.
-    df["Sentence"] = df["Sentence"].astype(str).str.strip()
-    df["Sentiment"] = (
-        df["Sentiment"].astype(str).str.strip().str.lower()
+    bilstm_epochs = st.slider(
+        "Maximum BiLSTM Epochs",
+        min_value=3,
+        max_value=20,
+        value=10
     )
 
-    # Remove empty sentences after whitespace has been stripped.
-    empty_sentence_mask = df["Sentence"].eq("")
-    empty_sentences_removed = int(empty_sentence_mask.sum())
-    df = df[~empty_sentence_mask].copy()
+    # --------------------------------------------------------
+    # BERT maximum epochs
+    # --------------------------------------------------------
 
-    # Remove malformed labels and keep only the intended three classes.
-    valid_label_mask = df["Sentiment"].isin(LABEL2ID)
-    invalid_labels_removed = int((~valid_label_mask).sum())
-    df = df[valid_label_mask].copy()
+    bert_epochs = st.slider(
+        "Maximum BERT Epochs",
+        min_value=2,
+        max_value=10,
+        value=5
+    )
 
-    # Create a temporary key so sentences differing only in case or spaces match.
-    df["_sentence_key"] = (
+    st.divider()
+
+    st.header("📚 Model Explanation")
+
+    # ========================================================
+    # MODEL 1 EXPLANATION
+    # ========================================================
+
+    with st.expander("1️⃣ SVM + TF-IDF"):
+
+        st.write(
+            """
+            ### SVM + TF-IDF
+
+            **Type:** Traditional Machine Learning
+
+            **Role:** Baseline model
+
+            ### TF-IDF
+
+            TF-IDF converts text into numerical features.
+
+            It gives more importance to useful words and less
+            importance to very common words.
+
+            This project uses:
+
+            - Unigram features
+            - Bigram features
+            - English stop-word removal
+
+            ### SVM
+
+            Support Vector Machine finds a decision boundary that
+            separates:
+
+            - Negative
+            - Neutral
+            - Positive
+
+            ### Advantages
+
+            - Fast training
+            - Effective for text classification
+            - Works well with high-dimensional data
+            - Good baseline model
+
+            ### Limitations
+
+            - Does not deeply understand word order
+            - Does not understand context like BERT
+
+            ### Early Stopping
+
+            Not applied because LinearSVC does not train using
+            neural-network epochs.
+            """
+        )
+
+    # ========================================================
+    # MODEL 2 EXPLANATION
+    # ========================================================
+
+    with st.expander("2️⃣ BiLSTM"):
+
+        st.write(
+            """
+            ### Bidirectional LSTM
+
+            **Type:** Deep Learning
+
+            BiLSTM learns patterns based on the sequence of words.
+
+            ### Process
+
+            1. Tokenizer converts words into numbers.
+            2. Embedding converts numbers into dense vectors.
+            3. Forward LSTM reads left → right.
+            4. Backward LSTM reads right → left.
+            5. Both directions are combined.
+            6. Dense layers classify sentiment.
+
+            ### Advantages
+
+            - Learns word sequence
+            - Learns contextual relationships
+            - Can identify more complex text patterns
+
+            ### Limitations
+
+            - Slower than SVM
+            - Requires more computation
+            - Can overfit
+
+            ### Early Stopping
+
+            BiLSTM monitors **validation loss**.
+
+            If validation loss does not improve for two epochs,
+            training automatically stops.
+
+            The best model weights are restored.
+            """
+        )
+
+    # ========================================================
+    # MODEL 3 EXPLANATION
+    # ========================================================
+
+    with st.expander("3️⃣ BERT"):
+
+        st.write(
+            """
+            ### BERT
+
+            **BERT = Bidirectional Encoder Representations
+            from Transformers**
+
+            **Type:** Transformer NLP model
+
+            BERT is already pretrained on a large amount of text.
+
+            We fine-tune it using the stock sentiment dataset.
+
+            ### Process
+
+            1. BERT tokenizer processes the sentence.
+            2. Words are converted into tokens.
+            3. Attention mechanisms examine word relationships.
+            4. BERT considers surrounding context.
+            5. Final classification layer predicts sentiment.
+
+            ### Advantages
+
+            - Strong contextual understanding
+            - Pretrained language knowledge
+            - Powerful for NLP classification
+
+            ### Limitations
+
+            - Slow on CPU
+            - Requires more memory
+            - GPU is recommended
+
+            ### Early Stopping
+
+            Validation **Macro F1-score** is checked after
+            every epoch.
+
+            Training stops when Macro F1 no longer improves.
+            """
+        )
+
+# ============================================================
+# PART 4: LOAD DATASET
+# ============================================================
+
+@st.cache_data
+def load_data():
+
+    # --------------------------------------------------------
+    # Read balanced dataset
+    # --------------------------------------------------------
+
+    df = pd.read_csv(
+        "stock_sentiment_balanced_40_30_30_unique.csv"
+    )
+
+    # Remove missing sentences or labels
+    df = df.dropna(
+        subset=["Sentence", "Sentiment"]
+    )
+
+    # Convert sentences to string
+    df["Sentence"] = (
         df["Sentence"]
-        .str.casefold()
-        .str.replace(r"\s+", " ", regex=True)
+        .astype(str)
         .str.strip()
     )
 
-    # Identify sentences that have been assigned more than one sentiment label.
-    labels_per_sentence = df.groupby("_sentence_key")["Sentiment"].nunique()
-    conflicting_keys = labels_per_sentence[labels_per_sentence > 1].index
-    conflicting_sentence_count = len(conflicting_keys)
-    conflicting_row_mask = df["_sentence_key"].isin(conflicting_keys)
-    conflicting_rows_removed = int(conflicting_row_mask.sum())
+    # Standardise sentiment labels
+    df["Sentiment"] = (
+        df["Sentiment"]
+        .astype(str)
+        .str.lower()
+        .str.strip()
+    )
 
-    # Remove all conflicting versions because their correct label is uncertain.
-    df = df[~conflicting_row_mask].copy()
+    # Keep only valid sentiment labels
+    df = df[
+        df["Sentiment"].isin(
+            ["negative", "neutral", "positive"]
+        )
+    ]
 
-    # Keep one copy when the same sentence and label appear repeatedly.
-    rows_before_deduplication = len(df)
-    df = df.drop_duplicates(subset="_sentence_key", keep="first")
-    duplicate_rows_removed = rows_before_deduplication - len(df)
+    # --------------------------------------------------------
+    # Remove duplicate sentences
+    #
+    # Your new dataset should already contain no duplicates,
+    # but this is an extra safety check.
+    # --------------------------------------------------------
 
-    # The temporary comparison key is not needed by BERT.
-    df = df.drop(columns="_sentence_key")
+    df = df.drop_duplicates(
+        subset=["Sentence"]
+    )
 
-    # Convert text sentiment labels into the numeric IDs required by BERT.
-    df["label"] = df["Sentiment"].map(LABEL2ID).astype(int)
+    # Reset row number
     df = df.reset_index(drop=True)
 
-    # Confirm that cleaning has not removed an entire sentiment class.
-    missing_classes = set(LABEL2ID) - set(df["Sentiment"].unique())
-    if missing_classes:
-        raise ValueError(
-            "The cleaned dataset is missing these classes: "
-            + ", ".join(sorted(missing_classes))
-        )
+    return df
 
-    # Return statistics so users can see exactly what the cleaning process did.
-    cleaning_summary = {
-        "encoding": detected_encoding,
-        "raw_rows": raw_row_count,
-        "clean_rows": len(df),
-        "missing_removed": missing_removed,
-        "empty_sentences_removed": empty_sentences_removed,
-        "invalid_labels_removed": invalid_labels_removed,
-        "conflicting_sentences": conflicting_sentence_count,
-        "conflicting_rows_removed": conflicting_rows_removed,
-        "duplicates_removed": duplicate_rows_removed,
-    }
+# Load the dataset
+df = load_data()
 
-    return df, cleaning_summary
+# ============================================================
+# PART 5: DATASET OVERVIEW
+# ============================================================
+
+st.header("1. Dataset Overview")
 
 
-# =============================================================================
-# PART 5: BALANCE ONLY THE TRAINING DATA
-# =============================================================================
+# Calculate total records for each class
+class_counts = (
+    df["Sentiment"]
+    .value_counts()
+    .reindex(
+        ["positive", "negative", "neutral"]
+    )
+)
 
-def balance_training_data(train_df, seed=RANDOM_SEED):
-    """Balance training classes using small-scale under/oversampling.
+# Calculate percentages
+class_percentage = (
+    df["Sentiment"]
+    .value_counts(normalize=True)
+    .mul(100)
+    .reindex(
+        ["positive", "negative", "neutral"]
+    )
+)
 
-    The median class size is used as the target:
-    - Classes larger than the target are randomly undersampled.
-    - Classes smaller than the target are randomly oversampled.
+# ============================================================
+# DATASET METRICS
+# ============================================================
 
-    Validation and testing data are never passed to this function.
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric(
+    "Total Records",
+    f"{len(df):,}"
+)
+
+col2.metric(
+    "Positive",
+    f"{class_counts['positive']:,}"
+)
+
+col3.metric(
+    "Negative",
+    f"{class_counts['negative']:,}"
+)
+
+col4.metric(
+    "Neutral",
+    f"{class_counts['neutral']:,}"
+)
+
+# ============================================================
+# DATASET PREVIEW
+# ============================================================
+
+left, right = st.columns([2, 1])
+
+with left:
+
+    st.subheader("Dataset Preview")
+
+    st.dataframe(
+        df.head(10),
+        use_container_width=True
+    )
+
+with right:
+
+    st.subheader("Class Distribution")
+
+    distribution_df = pd.DataFrame(
+        {
+            "Sentiment": class_counts.index,
+            "Count": class_counts.values,
+            "Percentage": class_percentage.values
+        }
+    )
+
+    st.dataframe(
+        distribution_df.round(2),
+        hide_index=True,
+        use_container_width=True
+    )
+
+    st.bar_chart(
+        distribution_df.set_index(
+            "Sentiment"
+        )["Count"]
+    )
+
+# ============================================================
+# PART 6: TRAIN / TEST SPLIT
+# ============================================================
+
+st.header("2. Train-Test Split")
+
+
+# Input sentences
+X = df["Sentence"]
+
+# Target sentiment labels
+y = df["Sentiment"]
+
+# ------------------------------------------------------------
+# 80% training data
+# 20% testing data
+#
+# stratify=y maintains approximately the same sentiment
+# distribution in the training and testing sets.
+# ------------------------------------------------------------
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.20,
+    random_state=42,
+    stratify=y
+)
+
+split_col1, split_col2 = st.columns(2)
+
+split_col1.metric(
+    "Training Records (80%)",
+    f"{len(X_train):,}"
+)
+
+split_col2.metric(
+    "Testing Records (20%)",
+    f"{len(X_test):,}"
+)
+
+st.info(
+    """
+    All three models use the **same final testing dataset**.
+    This provides a fairer comparison between SVM, BiLSTM and BERT.
+    """
+)
+
+# ============================================================
+# PART 7: COMMON MODEL EVALUATION FUNCTION
+# ============================================================
+
+def evaluate_model(
+    model_name,
+    y_true,
+    y_prediction,
+    training_time
+):
+
+    """
+    Calculate classification metrics.
+
+    Macro averaging is used because each sentiment class
+    receives equal importance.
     """
 
-    class_counts = train_df["label"].value_counts()
-    target_size = int(class_counts.median())
-    balanced_groups = []
-
-    for label_id, group in train_df.groupby("label"):
-        balanced_group = group.sample(
-            n=target_size,
-            # Duplicate examples only when a class is smaller than the target.
-            replace=len(group) < target_size,
-            random_state=seed,
-        )
-        balanced_groups.append(balanced_group)
-
-    # Join the three classes and shuffle their row order.
-    balanced_df = pd.concat(balanced_groups, ignore_index=True)
-    balanced_df = balanced_df.sample(frac=1, random_state=seed)
-
-    return balanced_df.reset_index(drop=True)
-
-
-# =============================================================================
-# PART 6: CALCULATE MODEL EVALUATION METRICS
-# =============================================================================
-
-def calculate_metrics(eval_prediction):
-    """Calculate accuracy plus weighted and macro evaluation scores."""
-
-    logits, actual_labels = eval_prediction
-    predicted_labels = np.argmax(logits, axis=-1)
-
-    # Weighted scores consider the number of records in each class.
-    precision_weighted, recall_weighted, f1_weighted, _ = (
-        precision_recall_fscore_support(
-            actual_labels,
-            predicted_labels,
-            average="weighted",
-            zero_division=0,
-        )
+    accuracy = accuracy_score(
+        y_true,
+        y_prediction
     )
 
-    # Macro scores give equal importance to all three sentiment classes.
-    precision_macro, recall_macro, f1_macro, _ = (
-        precision_recall_fscore_support(
-            actual_labels,
-            predicted_labels,
-            average="macro",
-            zero_division=0,
-        )
+    precision = precision_score(
+        y_true,
+        y_prediction,
+        average="macro",
+        zero_division=0
+    )
+
+    recall = recall_score(
+        y_true,
+        y_prediction,
+        average="macro",
+        zero_division=0
+    )
+
+    f1 = f1_score(
+        y_true,
+        y_prediction,
+        average="macro",
+        zero_division=0
     )
 
     return {
-        "accuracy": accuracy_score(actual_labels, predicted_labels),
-        "precision_weighted": precision_weighted,
-        "recall_weighted": recall_weighted,
-        "f1_weighted": f1_weighted,
-        "precision_macro": precision_macro,
-        "recall_macro": recall_macro,
-        "f1_macro": f1_macro,
+        "Model": model_name,
+        "Accuracy": accuracy,
+        "Precision": precision,
+        "Recall": recall,
+        "F1-Score": f1,
+        "Training Time (s)": training_time
     }
 
+# ============================================================
+# PART 8: MODEL 1 - SVM + TF-IDF
+# ============================================================
 
-# =============================================================================
-# PART 7: CONVERT A PANDAS DATAFRAME INTO A BERT DATASET
-# =============================================================================
+def train_svm():
 
-def make_bert_dataset(frame, tokenizer):
-    """Tokenize sentences and create a Hugging Face Dataset."""
+    """
+    Train SVM using TF-IDF text features.
+    """
+    start_time = time.time()
 
-    dataset = Dataset.from_pandas(
-        frame[["Sentence", "label"]].reset_index(drop=True),
-        preserve_index=False,
+    # --------------------------------------------------------
+    # TF-IDF VECTORIZER
+    # --------------------------------------------------------
+
+    vectorizer = TfidfVectorizer(
+
+        # Use single words and two-word combinations
+        ngram_range=(1, 2),
+
+        # Ignore words appearing in more than 90% of documents
+        max_df=0.90,
+
+        # Ignore words appearing fewer than 3 times
+        min_df=3,
+
+        # Remove common English words
+        stop_words="english",
+
+        # Limit total number of TF-IDF features
+        max_features=30000,
+
+        lowercase=True
     )
 
-    def tokenize_batch(batch):
-        # Truncation limits every sentence to at most 128 BERT tokens.
-        return tokenizer(
-            batch["Sentence"],
-            truncation=True,
-            max_length=128,
-        )
-
-    return dataset.map(
-        tokenize_batch,
-        batched=True,
-        remove_columns=["Sentence"],
+    # Learn TF-IDF vocabulary from training data only
+    X_train_tfidf = vectorizer.fit_transform(
+        X_train
     )
 
-
-# =============================================================================
-# PART 8: BUILD VERSION-COMPATIBLE TRAINING ARGUMENTS
-# =============================================================================
-
-def create_training_arguments(output_directory, epochs, batch_size):
-    """Create TrainingArguments compatible with old and new Transformers."""
-
-    argument_values = {
-        "output_dir": output_directory,
-        "save_strategy": "no",
-        "learning_rate": 2e-5,
-        "per_device_train_batch_size": batch_size,
-        "per_device_eval_batch_size": batch_size,
-        "num_train_epochs": epochs,
-        "weight_decay": 0.01,
-        "warmup_steps": 0,
-        "fp16": torch.cuda.is_available(),
-        "report_to": "none",
-        "seed": RANDOM_SEED,
-        "logging_strategy": "epoch",
-    }
-
-    # New Transformers versions use eval_strategy; older ones use
-    # evaluation_strategy. Checking the signature prevents a version error.
-    parameters = inspect.signature(TrainingArguments.__init__).parameters
-    if "eval_strategy" in parameters:
-        argument_values["eval_strategy"] = "epoch"
-    else:
-        argument_values["evaluation_strategy"] = "epoch"
-
-    return TrainingArguments(**argument_values)
-
-
-# =============================================================================
-# PART 9: FINE-TUNE BERT AND TEST THE MODEL
-# =============================================================================
-
-def train_bert(df, epochs, batch_size):
-    """Split, balance, fine-tune, and evaluate the BERT model."""
-
-    set_seed(RANDOM_SEED)
-
-    # First split: 70% training and 30% temporary data.
-    train_df, temporary_df = train_test_split(
-        df,
-        test_size=0.30,
-        random_state=RANDOM_SEED,
-        stratify=df["label"],
+    # Apply same vocabulary to testing data
+    X_test_tfidf = vectorizer.transform(
+        X_test
     )
 
-    # Second split: divide the temporary data into 15% validation and 15% test.
-    validation_df, test_df = train_test_split(
-        temporary_df,
-        test_size=0.50,
-        random_state=RANDOM_SEED,
-        stratify=temporary_df["label"],
+    # --------------------------------------------------------
+    # CREATE SVM MODEL
+    # --------------------------------------------------------
+
+    svm_model = LinearSVC(
+        C=1.0,
+        max_iter=5000,
+        random_state=42
     )
 
-    # Save the natural training counts before balancing for comparison.
-    train_counts_before = (
-        train_df["Sentiment"]
-        .value_counts()
-        .reindex(LABEL_NAMES, fill_value=0)
-        .to_dict()
+    # Train model
+    svm_model.fit(
+        X_train_tfidf,
+        y_train
     )
 
-    # Balance training data only; validation and test distributions stay natural.
-    train_df = balance_training_data(train_df)
-
-    train_counts_after = (
-        train_df["Sentiment"]
-        .value_counts()
-        .reindex(LABEL_NAMES, fill_value=0)
-        .to_dict()
+    # Predict testing data
+    predictions = svm_model.predict(
+        X_test_tfidf
     )
 
-    # Download the tokenizer and convert text into BERT token IDs.
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    train_dataset = make_bert_dataset(train_df, tokenizer)
-    validation_dataset = make_bert_dataset(validation_df, tokenizer)
-    test_dataset = make_bert_dataset(test_df, tokenizer)
-
-    # Load BERT with a new classification layer containing three outputs.
-    model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
-        num_labels=3,
-        label2id=LABEL2ID,
-        id2label=ID2LABEL,
+    training_time = (
+        time.time() - start_time
     )
 
-    # Store temporary checkpoints outside the project folder.
-    output_directory = tempfile.mkdtemp(prefix="bert_streamlit_")
-    training_arguments = create_training_arguments(
-        output_directory,
-        epochs,
-        batch_size,
+    return (
+        svm_model,
+        vectorizer,
+        predictions,
+        training_time
     )
 
-    # Configure the Hugging Face Trainer.
-    trainer_options = {
-        "model": model,
-        "args": training_arguments,
-        "train_dataset": train_dataset,
-        "eval_dataset": validation_dataset,
-        "data_collator": DataCollatorWithPadding(tokenizer=tokenizer),
-        "compute_metrics": calculate_metrics,
-    }
+# ============================================================
+# PART 9: MODEL 2 - BiLSTM
+# ============================================================
 
-    # New Transformers uses processing_class; older versions use tokenizer.
-    trainer_parameters = inspect.signature(Trainer.__init__).parameters
-    if "processing_class" in trainer_parameters:
-        trainer_options["processing_class"] = tokenizer
-    else:
-        trainer_options["tokenizer"] = tokenizer
+def train_bilstm():
 
-    trainer = Trainer(**trainer_options)
+    """
+    Train a Bidirectional LSTM neural network.
+    """
 
-    # Fine-tune BERT on the balanced training set.
-    trainer.train()
+    start_time = time.time()
 
-    # Evaluate once on the untouched test set.
-    test_output = trainer.predict(test_dataset)
-    actual_labels = test_output.label_ids
-    predicted_labels = np.argmax(test_output.predictions, axis=-1)
+    # ========================================================
+    # CREATE INTERNAL TRAINING / VALIDATION SPLIT
+    # ========================================================
 
-    metrics = calculate_metrics((test_output.predictions, actual_labels))
+    # We do NOT use the final test set for early stopping.
+    #
+    # 90% of original training data = model training
+    # 10% of original training data = validation
 
-    report = classification_report(
-        actual_labels,
-        predicted_labels,
-        labels=[0, 1, 2],
-        target_names=LABEL_NAMES,
-        output_dict=True,
-        zero_division=0,
+    (
+        X_lstm_train,
+        X_lstm_val,
+        y_lstm_train,
+        y_lstm_val
+    ) = train_test_split(
+
+        X_train,
+        y_train,
+
+        test_size=0.10,
+
+        random_state=42,
+
+        stratify=y_train
     )
 
-    matrix = confusion_matrix(
-        actual_labels,
-        predicted_labels,
-        labels=[0, 1, 2],
+    # ========================================================
+    # LABEL ENCODING
+    # ========================================================
+
+    encoder = LabelEncoder()
+
+    # Learn the sentiment classes
+    encoder.fit(y_train)
+
+    y_lstm_train_encoded = encoder.transform(
+        y_lstm_train
     )
 
-    # Store only the objects required by the dashboard and prediction function.
-    return {
-        "model": trainer.model,
-        "tokenizer": tokenizer,
-        "metrics": metrics,
-        "report": report,
-        "matrix": matrix,
-        "sizes": {
-            "training_balanced": len(train_df),
-            "validation": len(validation_df),
-            "testing": len(test_df),
-        },
-        "train_counts_before": train_counts_before,
-        "train_counts_after": train_counts_after,
-    }
-
-
-# =============================================================================
-# PART 10: PREDICT THE SENTIMENT OF ONE NEW SENTENCE
-# =============================================================================
-
-def predict_sentence(sentence, model, tokenizer):
-    """Return the predicted sentiment and probability for every class."""
-
-    inputs = tokenizer(
-        sentence,
-        return_tensors="pt",
-        truncation=True,
-        max_length=128,
+    y_lstm_val_encoded = encoder.transform(
+        y_lstm_val
     )
 
-    # Put the new input on the same CPU or GPU device as the model.
-    device = next(model.parameters()).device
-    inputs = {name: value.to(device) for name, value in inputs.items()}
+    # ========================================================
+    # TOKENIZER SETTINGS
+    # ========================================================
 
-    model.eval()
-    with torch.no_grad():
-        logits = model(**inputs).logits
-        probabilities = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+    max_words = 20000
 
-    prediction_id = int(np.argmax(probabilities))
-    return ID2LABEL[prediction_id], probabilities
+    max_length = 100
 
 
-# =============================================================================
-# PART 11: CONFIGURE THE STREAMLIT PAGE
-# =============================================================================
-
-st.set_page_config(
-    page_title="Balanced BERT Stock Sentiment Analysis",
-    page_icon="📈",
-    layout="wide",
-)
-
-st.title("Balanced BERT Stock Sentiment Analysis")
-st.write(
-    "Upload a stock sentiment CSV, clean and balance its training data, "
-    "fine-tune BERT, and evaluate positive, negative, and neutral predictions."
-)
-
-st.info("Label mapping: negative = 0, positive = 1, neutral = 2")
-
-
-# =============================================================================
-# PART 12: CREATE THE SIDEBAR TRAINING CONTROLS
-# =============================================================================
-
-with st.sidebar:
-    st.header("Training settings")
-
-    epochs = st.slider(
-        "Epochs",
-        min_value=1,
-        max_value=4,
-        value=2,
-        help="More epochs may improve learning but increase training time.",
+    tokenizer = Tokenizer(
+        num_words=max_words,
+        oov_token="<OOV>"
     )
 
-    batch_size = st.selectbox(
-        "Batch size",
-        options=[4, 8, 16],
-        index=1,
-        help="Use 4 if your computer runs out of memory.",
+    # Learn vocabulary from training data only
+    tokenizer.fit_on_texts(
+        X_lstm_train
     )
 
-    device_name = "GPU" if torch.cuda.is_available() else "CPU"
-    st.write(f"Training device: **{device_name}**")
-    st.caption("CPU training can take a long time. Do not close the terminal.")
-
-
-# =============================================================================
-# PART 13: UPLOAD, CLEAN, AND DISPLAY THE DATASET
-# =============================================================================
-
-uploaded_file = st.file_uploader(
-    "Upload datav1.csv",
-    type=["csv"],
-    help="The CSV must contain Sentence and Sentiment columns.",
-)
-
-if uploaded_file is not None:
-    try:
-        dataframe, cleaning_summary = clean_data(uploaded_file)
-    except Exception as error:
-        st.error(f"Dataset error: {error}")
-        st.stop()
-
-    # Create a signature so results from a different uploaded dataset are cleared.
-    dataset_bytes = dataframe[["Sentence", "Sentiment"]].to_csv(
-        index=False
-    ).encode("utf-8")
-    dataset_signature = hashlib.sha256(dataset_bytes).hexdigest()
-
-    if st.session_state.get("dataset_signature") != dataset_signature:
-        st.session_state.pop("bert_results", None)
-        st.session_state["dataset_signature"] = dataset_signature
-
-    st.subheader("1. Cleaned dataset overview")
-
-    overview_column, distribution_column = st.columns([2, 1])
-
-    with overview_column:
-        st.dataframe(
-            dataframe[["Sentence", "Sentiment"]].head(20),
-            use_container_width=True,
-        )
-
-    with distribution_column:
-        class_distribution = (
-            dataframe["Sentiment"]
-            .value_counts()
-            .reindex(LABEL_NAMES, fill_value=0)
-        )
-        st.write("Clean class distribution")
-        st.bar_chart(class_distribution)
-        st.metric("Clean records", f"{len(dataframe):,}")
-
-    # Explain how many records were removed for each data-quality issue.
-    with st.expander("View cleaning details"):
-        st.write(f"Detected encoding: **{cleaning_summary['encoding']}**")
-        st.write(f"Original records: **{cleaning_summary['raw_rows']:,}**")
-        st.write(f"Clean records: **{cleaning_summary['clean_rows']:,}**")
-        st.write(
-            "Missing-label or missing-sentence records removed: "
-            f"**{cleaning_summary['missing_removed']:,}**"
-        )
-        st.write(
-            "Empty sentences removed: "
-            f"**{cleaning_summary['empty_sentences_removed']:,}**"
-        )
-        st.write(
-            "Invalid-label records removed: "
-            f"**{cleaning_summary['invalid_labels_removed']:,}**"
-        )
-        st.write(
-            "Conflicting sentences found: "
-            f"**{cleaning_summary['conflicting_sentences']:,}**"
-        )
-        st.write(
-            "Rows removed because of conflicting labels: "
-            f"**{cleaning_summary['conflicting_rows_removed']:,}**"
-        )
-        st.write(
-            "Same-label duplicate rows removed: "
-            f"**{cleaning_summary['duplicates_removed']:,}**"
-        )
-
-    st.subheader("2. Train the BERT model")
-    st.warning(
-        "Training downloads BERT the first time. CPU training may take a long "
-        "time; using a CUDA-compatible GPU is much faster."
+    # Convert text to number sequences
+    train_sequences = tokenizer.texts_to_sequences(
+        X_lstm_train
     )
 
-    if st.button("Train balanced BERT model", type="primary"):
-        with st.spinner("Cleaning, balancing, and fine-tuning BERT..."):
-            try:
-                st.session_state["bert_results"] = train_bert(
-                    dataframe,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                )
-            except Exception as error:
-                st.exception(error)
-                st.stop()
-
-        st.success("BERT training and testing completed.")
-
-
-# =============================================================================
-# PART 14: DISPLAY MODEL RESULTS
-# =============================================================================
-
-if "bert_results" in st.session_state:
-    results = st.session_state["bert_results"]
-    metrics = results["metrics"]
-    sizes = results["sizes"]
-
-    st.subheader("3. Model evaluation results")
-    st.caption(
-        f"Balanced training: {sizes['training_balanced']:,} | "
-        f"Validation: {sizes['validation']:,} | "
-        f"Unchanged test set: {sizes['testing']:,}"
+    validation_sequences = tokenizer.texts_to_sequences(
+        X_lstm_val
     )
 
-    # Display the most important overall evaluation measurements.
-    metric_columns = st.columns(4)
-    metric_columns[0].metric("Accuracy", f"{metrics['accuracy']:.4f}")
-    metric_columns[1].metric(
-        "Macro precision",
-        f"{metrics['precision_macro']:.4f}",
+    test_sequences = tokenizer.texts_to_sequences(
+        X_test
     )
-    metric_columns[2].metric(
-        "Macro recall",
-        f"{metrics['recall_macro']:.4f}",
-    )
-    metric_columns[3].metric("Macro F1-score", f"{metrics['f1_macro']:.4f}")
 
-    # Separate detailed results into easy-to-read tabs.
-    tab1, tab2, tab3, tab4 = st.tabs(
+    # ========================================================
+    # PAD SEQUENCES
+    # ========================================================
+
+    X_lstm_train_pad = pad_sequences(
+        train_sequences,
+        maxlen=max_length,
+        padding="post",
+        truncating="post"
+    )
+
+    X_lstm_val_pad = pad_sequences(
+        validation_sequences,
+        maxlen=max_length,
+        padding="post",
+        truncating="post"
+    )
+
+    X_test_pad = pad_sequences(
+        test_sequences,
+        maxlen=max_length,
+        padding="post",
+        truncating="post"
+    )
+
+    # ========================================================
+    # BUILD BiLSTM MODEL
+    # ========================================================
+
+    bilstm_model = Sequential(
+
         [
-            "Class balancing",
-            "Classification report",
-            "Confusion matrix",
-            "Test a sentence",
+
+            # Convert word IDs into dense vectors
+            Embedding(
+                input_dim=max_words,
+                output_dim=128
+            ),
+
+            # Read sentence forward and backward
+            Bidirectional(
+                LSTM(
+                    64,
+                    return_sequences=False
+                )
+            ),
+
+            # Reduce overfitting
+            Dropout(0.5),
+
+            # Hidden layer
+            Dense(
+                64,
+                activation="relu"
+            ),
+
+            Dropout(0.5),
+
+            # Three sentiment classes
+            Dense(
+                3,
+                activation="softmax"
+            )
         ]
     )
 
-    with tab1:
-        st.write("Training distribution before and after balancing")
+    # ========================================================
+    # COMPILE MODEL
+    # ========================================================
 
-        balancing_table = pd.DataFrame(
-            {
-                "Before balancing": results["train_counts_before"],
-                "After balancing": results["train_counts_after"],
-            }
-        ).reindex(LABEL_NAMES)
+    bilstm_model.compile(
 
-        st.dataframe(balancing_table, use_container_width=True)
-        st.bar_chart(balancing_table)
-        st.caption(
-            "Only the training set is balanced. Validation and test sets "
-            "remain unchanged for realistic evaluation."
+        optimizer="adam",
+
+        loss="sparse_categorical_crossentropy",
+
+        metrics=["accuracy"]
+    )
+
+    # ========================================================
+    # EARLY STOPPING
+    # ========================================================
+
+    early_stopping = EarlyStopping(
+
+        # Monitor validation loss
+        monitor="val_loss",
+
+        # Stop after 2 epochs without improvement
+        patience=2,
+
+        # Minimum improvement required
+        min_delta=0.001,
+
+        # Restore weights from best epoch
+        restore_best_weights=True,
+
+        verbose=1
+    )
+
+    # ========================================================
+    # TRAIN BiLSTM
+    # ========================================================
+
+    history = bilstm_model.fit(
+
+        X_lstm_train_pad,
+        y_lstm_train_encoded,
+
+        validation_data=(
+            X_lstm_val_pad,
+            y_lstm_val_encoded
+        ),
+
+        # Maximum epochs
+        epochs=bilstm_epochs,
+
+        batch_size=64,
+
+        callbacks=[
+            early_stopping
+        ],
+
+        verbose=1
+    )
+
+    # ========================================================
+    # TEST PREDICTION
+    # ========================================================
+
+    prediction_probability = (
+        bilstm_model.predict(
+            X_test_pad,
+            verbose=0
+        )
+    )
+
+    prediction_numbers = np.argmax(
+        prediction_probability,
+        axis=1
+    )
+
+    predictions = encoder.inverse_transform(
+        prediction_numbers
+    )
+
+    training_time = (
+        time.time() - start_time
+    )
+
+    # Number of epochs actually completed
+    epochs_completed = len(
+        history.history["loss"]
+    )
+
+    return (
+        bilstm_model,
+        tokenizer,
+        encoder,
+        predictions,
+        training_time,
+        history,
+        epochs_completed
+    )
+
+# ============================================================
+# PART 10: CUSTOM DATASET FOR BERT
+# ============================================================
+
+class SentimentDataset(
+    torch.utils.data.Dataset
+):
+
+    """
+    Custom PyTorch Dataset used by Hugging Face Trainer.
+    """
+
+    def __init__(
+        self,
+        encodings,
+        labels
+    ):
+
+        self.encodings = encodings
+
+        self.labels = labels
+
+    def __getitem__(
+        self,
+        index
+    ):
+
+        item = {
+
+            key: torch.tensor(
+                value[index]
+            )
+
+            for key, value
+            in self.encodings.items()
+        }
+
+        item["labels"] = torch.tensor(
+            self.labels[index],
+            dtype=torch.long
         )
 
-    with tab2:
-        report_dataframe = pd.DataFrame(results["report"]).transpose()
-        st.dataframe(report_dataframe.round(4), use_container_width=True)
+        return item
 
-        st.write("Weighted measurements")
+    def __len__(self):
+
+        return len(
+            self.labels
+        )
+
+# ============================================================
+# PART 11: BERT METRIC FUNCTION
+# ============================================================
+
+def compute_bert_metrics(
+    eval_prediction
+):
+
+    """
+    Calculate BERT validation metrics after each epoch.
+
+    Macro F1 is used for early stopping.
+    """
+
+    logits, labels = eval_prediction
+
+    predictions = np.argmax(
+        logits,
+        axis=-1
+    )
+
+    accuracy = accuracy_score(
+        labels,
+        predictions
+    )
+
+    macro_f1 = f1_score(
+        labels,
+        predictions,
+        average="macro",
+        zero_division=0
+    )
+
+    return {
+
+        "accuracy": accuracy,
+
+        "f1": macro_f1
+    }
+
+# ============================================================
+# PART 12: MODEL 3 - BERT
+# ============================================================
+
+def train_bert():
+
+    """
+    Fine-tune BERT for three-class sentiment classification.
+    """
+
+    start_time = time.time()
+
+    # ========================================================
+    # INTERNAL TRAINING / VALIDATION SPLIT
+    # ========================================================
+
+    (
+        X_bert_train,
+        X_bert_val,
+        y_bert_train,
+        y_bert_val
+    ) = train_test_split(
+
+        X_train,
+        y_train,
+
+        test_size=0.10,
+
+        random_state=42,
+
+        stratify=y_train
+    )
+
+    # ========================================================
+    # LABEL ENCODING
+    # ========================================================
+
+    encoder = LabelEncoder()
+
+    encoder.fit(
+        y_train
+    )
+
+    y_bert_train_encoded = encoder.transform(
+        y_bert_train
+    )
+
+    y_bert_val_encoded = encoder.transform(
+        y_bert_val
+    )
+
+    y_test_encoded = encoder.transform(
+        y_test
+    )
+
+    # ========================================================
+    # LOAD PRETRAINED BERT TOKENIZER
+    # ========================================================
+
+    tokenizer = BertTokenizerFast.from_pretrained(
+        "bert-base-uncased"
+    )
+
+    # ========================================================
+    # TOKENIZE TRAINING DATA
+    # ========================================================
+
+    train_encodings = tokenizer(
+
+        X_bert_train.tolist(),
+
+        truncation=True,
+
+        padding=True,
+
+        max_length=128
+    )
+
+    # ========================================================
+    # TOKENIZE VALIDATION DATA
+    # ========================================================
+
+    validation_encodings = tokenizer(
+
+        X_bert_val.tolist(),
+
+        truncation=True,
+
+        padding=True,
+
+        max_length=128
+    )
+
+    # ========================================================
+    # TOKENIZE TEST DATA
+    # ========================================================
+
+    test_encodings = tokenizer(
+
+        X_test.tolist(),
+
+        truncation=True,
+
+        padding=True,
+
+        max_length=128
+    )
+
+    # ========================================================
+    # CREATE DATASETS
+    # ========================================================
+
+    train_dataset = SentimentDataset(
+
+        train_encodings,
+
+        y_bert_train_encoded.tolist()
+    )
+
+    validation_dataset = SentimentDataset(
+
+        validation_encodings,
+
+        y_bert_val_encoded.tolist()
+    )
+
+    test_dataset = SentimentDataset(
+
+        test_encodings,
+
+        y_test_encoded.tolist()
+    )
+
+    # ========================================================
+    # LOAD PRETRAINED BERT MODEL
+    # ========================================================
+
+    bert_model = (
+        BertForSequenceClassification
+        .from_pretrained(
+
+            "bert-base-uncased",
+
+            num_labels=3
+        )
+    )
+
+    # ========================================================
+    # TRAINING ARGUMENTS
+    # ========================================================
+
+    training_arguments = TrainingArguments(
+
+        # Folder to store checkpoints
+        output_dir="./bert_results",
+
+        # Maximum training epochs
+        num_train_epochs=bert_epochs,
+
+        # Training batch size
+        per_device_train_batch_size=16,
+
+        # Validation / test batch size
+        per_device_eval_batch_size=32,
+
+        # Standard BERT fine-tuning learning rate
+        learning_rate=2e-5,
+
+        # Regularisation
+        weight_decay=0.01,
+
+        # Evaluate after every epoch
+        eval_strategy="epoch",
+
+        # Save after every epoch
+        save_strategy="epoch",
+
+        # Restore best model automatically
+        load_best_model_at_end=True,
+
+        # Use Macro F1 as best-model metric
+        metric_for_best_model="f1",
+
+        # Higher F1 is better
+        greater_is_better=True,
+
+        # Keep only two checkpoints
+        save_total_limit=2,
+
+        # Reduce console output
+        logging_steps=100,
+
+        # Disable external logging
+        report_to="none",
+
+        # Use mixed precision when NVIDIA GPU is available
+        fp16=torch.cuda.is_available(),
+
+        # Reproducibility
+        seed=42
+    )
+
+    # ========================================================
+    # CREATE TRAINER
+    # ========================================================
+
+    trainer = Trainer(
+
+        model=bert_model,
+
+        args=training_arguments,
+
+        train_dataset=train_dataset,
+
+        # Validation set is used for early stopping
+        eval_dataset=validation_dataset,
+
+        # Calculate accuracy and Macro F1
+        compute_metrics=compute_bert_metrics,
+
+        # BERT early stopping
+        callbacks=[
+
+            EarlyStoppingCallback(
+
+                # Stop after two evaluations
+                # without improvement
+                early_stopping_patience=2,
+
+                # Minimum required F1 improvement
+                early_stopping_threshold=0.001
+            )
+        ]
+    )
+
+    # ========================================================
+    # FINE-TUNE BERT
+    # ========================================================
+
+    trainer.train()
+
+    # ========================================================
+    # TEST BERT
+    # ========================================================
+
+    prediction_output = trainer.predict(
+        test_dataset
+    )
+
+    predicted_numbers = np.argmax(
+
+        prediction_output.predictions,
+
+        axis=1
+    )
+
+    predictions = encoder.inverse_transform(
+        predicted_numbers
+    )
+
+    training_time = (
+        time.time() - start_time
+    )
+
+    # Find epoch where training stopped
+    completed_epoch = trainer.state.epoch
+
+    # Find best validation Macro F1
+    best_metric = trainer.state.best_metric
+
+    return (
+
+        bert_model,
+
+        tokenizer,
+
+        encoder,
+
+        predictions,
+
+        training_time,
+
+        completed_epoch,
+
+        best_metric
+    )
+
+# ============================================================
+# PART 13: MODEL TRAINING SECTION
+# ============================================================
+
+st.header("3. Train and Compare Models")
+
+# ------------------------------------------------------------
+# Device information
+# ------------------------------------------------------------
+
+if torch.cuda.is_available():
+
+    st.success(
+        "🚀 NVIDIA GPU detected. BERT can use GPU acceleration."
+    )
+
+else:
+
+    st.warning(
+        """
+        ⚠️ GPU was not detected.
+
+        BERT will run on CPU and may train much more slowly.
+        SVM and BiLSTM can still be trained normally.
+        """
+    )
+
+# ============================================================
+# TRAIN BUTTON
+# ============================================================
+
+if st.button(
+    "🚀 Train & Compare All 3 Models",
+    type="primary",
+    use_container_width=True
+):
+
+    results = []
+
+    predictions_dictionary = {}
+
+    # ========================================================
+    # MODEL 1: SVM
+    # ========================================================
+
+    with st.status(
+        "Training SVM + TF-IDF...",
+        expanded=True
+    ) as svm_status:
+
         st.write(
-            {
-                "Precision weighted": round(
-                    metrics["precision_weighted"], 4
-                ),
-                "Recall weighted": round(metrics["recall_weighted"], 4),
-                "F1 weighted": round(metrics["f1_weighted"], 4),
-            }
+            "Step 1: Creating TF-IDF features..."
         )
 
-    with tab3:
-        # Draw the confusion matrix without requiring the Seaborn package.
-        figure, axis = plt.subplots(figsize=(7, 5))
-        matrix_display = ConfusionMatrixDisplay(
-            confusion_matrix=results["matrix"],
-            display_labels=LABEL_NAMES,
-        )
-        matrix_display.plot(
-            ax=axis,
-            cmap="Blues",
-            values_format="d",
-            colorbar=False,
-        )
-        axis.set_title("BERT Stock Sentiment Confusion Matrix")
-        figure.tight_layout()
-        st.pyplot(figure)
-        plt.close(figure)
-
-    with tab4:
-        sentence = st.text_area(
-            "Enter a financial sentence",
-            placeholder=(
-                "Example: The company reported higher profits this quarter."
-            ),
+        st.write(
+            "Step 2: Training Support Vector Machine..."
         )
 
-        if st.button("Predict sentiment"):
-            if not sentence.strip():
-                st.warning("Please enter a sentence first.")
-            else:
-                predicted_sentiment, probabilities = predict_sentence(
-                    sentence,
-                    results["model"],
-                    results["tokenizer"],
-                )
+        (
+            svm_model,
+            svm_vectorizer,
+            svm_predictions,
+            svm_time
+        ) = train_svm()
 
-                st.success(
-                    f"Predicted sentiment: {predicted_sentiment.upper()}"
-                )
+        predictions_dictionary[
+            "SVM + TF-IDF"
+        ] = svm_predictions
 
-                probability_table = pd.DataFrame(
-                    {
-                        "Sentiment": LABEL_NAMES,
-                        "Probability": probabilities,
-                    }
-                )
-                probability_table["Probability"] = probability_table[
-                    "Probability"
-                ].map(lambda value: f"{value:.2%}")
+        results.append(
 
-                st.dataframe(
-                    probability_table,
-                    use_container_width=True,
-                    hide_index=True,
-                )
+            evaluate_model(
+
+                "SVM + TF-IDF",
+
+                y_test,
+
+                svm_predictions,
+
+                svm_time
+            )
+        )
+
+        svm_status.update(
+            label="✅ SVM + TF-IDF completed",
+            state="complete"
+        )
+
+    # ========================================================
+    # MODEL 2: BiLSTM
+    # ========================================================
+
+    with st.status(
+        "Training BiLSTM...",
+        expanded=True
+    ) as lstm_status:
+
+        st.write(
+            "Step 1: Tokenizing sentences..."
+        )
+
+        st.write(
+            "Step 2: Creating embedding sequences..."
+        )
+
+        st.write(
+            "Step 3: Training Bidirectional LSTM..."
+        )
+
+        st.write(
+            "Early stopping monitors validation loss."
+        )
+
+        (
+            bilstm_model,
+            bilstm_tokenizer,
+            bilstm_encoder,
+            bilstm_predictions,
+            bilstm_time,
+            bilstm_history,
+            bilstm_epochs_completed
+        ) = train_bilstm()
+
+        predictions_dictionary[
+            "BiLSTM"
+        ] = bilstm_predictions
+
+        results.append(
+
+            evaluate_model(
+
+                "BiLSTM",
+
+                y_test,
+
+                bilstm_predictions,
+
+                bilstm_time
+            )
+        )
+
+        lstm_status.update(
+            label="✅ BiLSTM completed",
+            state="complete"
+        )
+
+    # ========================================================
+    # MODEL 3: BERT
+    # ========================================================
+
+    with st.status(
+        "Training BERT...",
+        expanded=True
+    ) as bert_status:
+
+        st.write(
+            "Step 1: Loading pretrained BERT tokenizer..."
+        )
+
+        st.write(
+            "Step 2: Tokenizing stock sentences..."
+        )
+
+        st.write(
+            "Step 3: Fine-tuning BERT..."
+        )
+
+        st.write(
+            "Early stopping monitors validation Macro F1."
+        )
+
+        (
+            bert_model,
+            bert_tokenizer,
+            bert_encoder,
+            bert_predictions,
+            bert_time,
+            bert_completed_epoch,
+            bert_best_f1
+        ) = train_bert()
+
+        predictions_dictionary[
+            "BERT"
+        ] = bert_predictions
+
+        results.append(
+
+            evaluate_model(
+
+                "BERT",
+
+                y_test,
+
+                bert_predictions,
+
+                bert_time
+            )
+        )
+
+        bert_status.update(
+            label="✅ BERT completed",
+            state="complete"
+        )
+
+    # ========================================================
+    # PART 14: MODEL COMPARISON TABLE
+    # ========================================================
+
+    st.header(
+        "4. Model Comparison Results"
+    )
 
 
-# =============================================================================
-# PART 15: SHOW INSTRUCTIONS BEFORE A FILE IS UPLOADED
-# =============================================================================
+    results_df = pd.DataFrame(
+        results
+    )
 
-if uploaded_file is None and "bert_results" not in st.session_state:
-    st.caption(
-        "Begin by uploading a CSV containing the Sentence and Sentiment columns."
+    # Sort highest accuracy first
+    results_df = results_df.sort_values(
+
+        by="Accuracy",
+
+        ascending=False
+
+    ).reset_index(drop=True)
+
+    # Add model ranking
+    results_df.insert(
+
+        0,
+
+        "Rank",
+
+        range(
+            1,
+            len(results_df) + 1
+        )
+    )
+
+    # Create formatted display version
+    display_results = results_df.copy()
+
+    for metric in [
+
+        "Accuracy",
+
+        "Precision",
+
+        "Recall",
+
+        "F1-Score"
+
+    ]:
+
+        display_results[metric] = (
+
+            display_results[metric]
+
+            .map(
+                lambda x: f"{x:.4f}"
+            )
+        )
+
+    display_results[
+        "Training Time (s)"
+    ] = (
+
+        display_results[
+            "Training Time (s)"
+        ]
+
+        .map(
+            lambda x: f"{x:.2f}"
+        )
+    )
+
+    st.dataframe(
+
+        display_results,
+
+        hide_index=True,
+
+        use_container_width=True
+    )
+
+    # ========================================================
+    # PART 15: BEST MODEL
+    # ========================================================
+
+    best_model = results_df.iloc[0]
+
+    st.success(
+        f"""
+        🏆 **Best Model: {best_model['Model']}**
+
+        Accuracy: **{best_model['Accuracy']:.4f}**
+
+        Precision: **{best_model['Precision']:.4f}**
+
+        Recall: **{best_model['Recall']:.4f}**
+
+        F1-Score: **{best_model['F1-Score']:.4f}**
+        """
+    )
+
+    # ========================================================
+    # PART 16: PERFORMANCE COMPARISON GRAPH
+    # ========================================================
+
+    st.subheader(
+        "Performance Metric Comparison"
+    )
+
+    comparison_chart = (
+
+        results_df
+
+        .set_index("Model")
+
+        [
+            [
+                "Accuracy",
+                "Precision",
+                "Recall",
+                "F1-Score"
+            ]
+        ]
+    )
+
+    st.bar_chart(
+        comparison_chart
+    )
+
+    # ========================================================
+    # PART 17: TRAINING TIME COMPARISON
+    # ========================================================
+
+    st.subheader(
+        "Training Time Comparison"
+    )
+
+    time_chart = (
+
+        results_df
+
+        .set_index("Model")
+
+        [["Training Time (s)"]]
+    )
+
+    st.bar_chart(
+        time_chart
+    )
+
+    # ========================================================
+    # PART 18: CONFUSION MATRIX
+    # ========================================================
+
+    st.header(
+        "5. Confusion Matrix Comparison"
+    )
+
+    # Same order for all three models
+    sentiment_labels = [
+
+        "negative",
+
+        "neutral",
+
+        "positive"
+    ]
+
+    cm1, cm2, cm3 = st.columns(3)
+
+    model_columns = [
+
+        cm1,
+
+        cm2,
+
+        cm3
+    ]
+
+    model_names = [
+
+        "SVM + TF-IDF",
+
+        "BiLSTM",
+
+        "BERT"
+    ]
+
+    for column, model_name in zip(
+
+        model_columns,
+
+        model_names
+    ):
+
+        with column:
+
+            st.subheader(
+                model_name
+            )
+
+            cm = confusion_matrix(
+
+                y_test,
+
+                predictions_dictionary[
+                    model_name
+                ],
+
+                labels=sentiment_labels
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(5, 4)
+            )
+
+            display = ConfusionMatrixDisplay(
+
+                confusion_matrix=cm,
+
+                display_labels=sentiment_labels
+            )
+
+            display.plot(
+
+                ax=ax,
+
+                values_format="d",
+
+                colorbar=False
+            )
+
+            ax.set_title(
+                f"{model_name}\nConfusion Matrix"
+            )
+
+            plt.tight_layout()
+
+            st.pyplot(fig)
+
+            plt.close(fig)
+
+    # ========================================================
+    # PART 19: CLASSIFICATION REPORTS
+    # ========================================================
+
+    st.header(
+        "6. Detailed Classification Reports"
+    )
+
+    svm_tab, lstm_tab, bert_tab = st.tabs(
+
+        [
+            "SVM + TF-IDF",
+            "BiLSTM",
+            "BERT"
+        ]
+    )
+
+    report_tabs = [
+
+        svm_tab,
+
+        lstm_tab,
+
+        bert_tab
+    ]
+
+    for tab, model_name in zip(
+
+        report_tabs,
+
+        model_names
+    ):
+
+        with tab:
+
+            report = classification_report(
+                y_test,
+
+                predictions_dictionary[
+                    model_name
+                ],
+
+                labels=sentiment_labels,
+
+                target_names=sentiment_labels,
+
+                output_dict=True,
+
+                zero_division=0
+            )
+
+            report_df = pd.DataFrame(
+                report
+            ).transpose()
+
+            st.dataframe(
+
+                report_df.round(4),
+
+                use_container_width=True
+            )
+
+    # ========================================================
+    # PART 20: EARLY STOPPING RESULTS
+    # ========================================================
+
+    st.header(
+        "7. Early Stopping Results"
+    )
+
+    early1, early2, early3 = st.columns(3)
+
+    # --------------------------------------------------------
+    # SVM
+    # --------------------------------------------------------
+
+    with early1:
+
+        st.subheader(
+            "SVM + TF-IDF"
+        )
+
+        st.info(
+            """
+            **Early Stopping: Not Applied**
+
+            LinearSVC is not trained using epochs.
+
+            Therefore validation-based early stopping is
+            not required.
+            """
+        )
+
+    # --------------------------------------------------------
+    # BiLSTM
+    # --------------------------------------------------------
+
+    with early2:
+
+        st.subheader(
+            "BiLSTM"
+        )
+
+        st.write(
+            f"""
+            Maximum epochs: **{bilstm_epochs}**
+
+            Completed epochs:
+            **{bilstm_epochs_completed}**
+
+            Monitor: **Validation Loss**
+
+            Patience: **2**
+
+            Minimum improvement: **0.001**
+            """
+        )
+
+        if (
+            bilstm_epochs_completed
+            <
+            bilstm_epochs
+        ):
+            st.success(
+                "✅ Early stopping activated."
+            )
+
+        else:
+            st.info(
+                "BiLSTM reached the maximum epochs."
+            )
+
+    # --------------------------------------------------------
+    # BERT
+    # --------------------------------------------------------
+
+    with early3:
+
+        st.subheader(
+            "BERT"
+        )
+
+        st.write(
+            f"""
+            Maximum epochs: **{bert_epochs}**
+
+            Training stopped around epoch:
+            **{bert_completed_epoch:.2f}**
+
+            Monitor:
+            **Validation Macro F1**
+
+            Patience: **2**
+
+            Minimum improvement: **0.001**
+            """
+        )
+
+        if bert_best_f1 is not None:
+
+            st.success(
+                f"""
+                Best validation Macro F1:
+
+                **{bert_best_f1:.4f}**
+                """
+            )
+
+    # ========================================================
+    # PART 21: BiLSTM TRAINING HISTORY
+    # ========================================================
+
+    st.header(
+        "8. BiLSTM Training History"
+    )
+
+    history_df = pd.DataFrame(
+        bilstm_history.history
+    )
+
+    # --------------------------------------------------------
+    # Accuracy
+    # --------------------------------------------------------
+
+    st.subheader(
+        "BiLSTM Training vs Validation Accuracy"
+    )
+
+    accuracy_history = history_df[
+
+        [
+            "accuracy",
+            "val_accuracy"
+        ]
+    ].copy()
+
+    accuracy_history.columns = [
+
+        "Training Accuracy",
+
+        "Validation Accuracy"
+    ]
+
+
+    st.line_chart(
+        accuracy_history
+    )
+
+    # --------------------------------------------------------
+    # Loss
+    # --------------------------------------------------------
+
+    st.subheader(
+        "BiLSTM Training vs Validation Loss"
+    )
+
+    loss_history = history_df[
+
+        [
+            "loss",
+            "val_loss"
+        ]
+    ].copy()
+
+
+    loss_history.columns = [
+
+        "Training Loss",
+
+        "Validation Loss"
+    ]
+
+    st.line_chart(
+        loss_history
+    )
+
+    # ========================================================
+    # PART 22: MODEL EXPLANATION TABLE
+    # ========================================================
+
+    st.header(
+        "9. Model Explanation Summary"
+    )
+
+    explanation_df = pd.DataFrame(
+
+        {
+
+            "Model": [
+
+                "SVM + TF-IDF",
+
+                "BiLSTM",
+
+                "BERT"
+            ],
+
+            "Model Type": [
+
+                "Machine Learning",
+
+                "Deep Learning",
+
+                "Transformer NLP"
+            ],
+
+            "Text Representation": [
+
+                "TF-IDF",
+
+                "Embedding",
+
+                "BERT Token Embeddings"
+            ],
+
+            "Context Understanding": [
+
+                "Low",
+
+                "Medium",
+
+                "High"
+            ],
+
+            "Training Speed": [
+
+                "Fast",
+
+                "Medium",
+
+                "Slow"
+            ],
+
+            "Early Stopping": [
+
+                "Not Applicable",
+
+                "Validation Loss",
+
+                "Validation Macro F1"
+            ]
+        }
+    )
+
+    st.dataframe(
+
+        explanation_df,
+
+        hide_index=True,
+
+        use_container_width=True
+    )
+
+    # ========================================================
+    # PART 23: INTERPRETATION GUIDE
+    # ========================================================
+
+    st.header(
+        "10. How to Interpret the Results"
+    )
+
+    st.write(
+        """
+        ### Accuracy
+
+        Accuracy measures the percentage of all test samples
+        classified correctly.
+
+        Higher accuracy indicates better overall classification.
+
+        ---
+
+        ### Precision
+
+        Precision measures how many predictions made for a
+        sentiment class were actually correct.
+
+        High precision means fewer false-positive predictions.
+
+        ---
+
+        ### Recall
+
+        Recall measures how many actual samples of a sentiment
+        class were successfully detected.
+
+        High recall means the model misses fewer samples.
+
+        ---
+
+        ### F1-Score
+
+        F1-score combines precision and recall.
+
+        Macro F1 gives equal importance to negative, neutral,
+        and positive sentiment.
+
+        ---
+
+        ### Confusion Matrix
+
+        The diagonal values show correct predictions.
+
+        Values outside the diagonal represent
+        misclassification.
+
+        ---
+
+        ### Training Time
+
+        Training time represents computational efficiency.
+
+        A model with slightly lower accuracy but much faster
+        training can still be useful depending on the
+        application.
+        """
+    )
+
+    # ========================================================
+    # PART 24: FINAL MODEL INTERPRETATION
+    # ========================================================
+
+    st.header(
+        "11. Final Model Interpretation"
+    )
+
+    st.write(
+        """
+        ### SVM + TF-IDF
+
+        SVM + TF-IDF is used as the baseline model.
+
+        It converts stock-related sentences into numerical
+        TF-IDF features and finds decision boundaries between
+        the three sentiment classes.
+
+        It is expected to train significantly faster than
+        deep-learning models.
+
+        ### BiLSTM
+
+        BiLSTM considers the sequential order of words.
+
+        The bidirectional architecture allows the model to
+        process information from both directions of a sentence.
+
+        Early stopping reduces the risk of overfitting.
+
+        ### BERT
+
+        BERT is a pretrained Transformer language model.
+
+        It uses contextual word representations and
+        self-attention, allowing it to interpret words based on
+        the surrounding sentence.
+
+        BERT is usually more computationally expensive than SVM
+        and BiLSTM.
+
+        ### Final Selection
+
+        The best model should not be selected using accuracy
+        alone.
+
+        The comparison should consider:
+
+        - Accuracy
+        - Precision
+        - Recall
+        - Macro F1-score
+        - Confusion matrix
+        - Training time
+        - Model complexity
+        """
     )
