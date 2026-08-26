@@ -1,13 +1,11 @@
-"""Streamlit dashboard for balanced three-class BERT stock sentiment analysis.
+"""
+Stock Sentiment Analysis Dashboard
 
 Run this application from PowerShell with:
 
     python -m streamlit run streamlit_app.py
 """
-# ============================================================
-# STOCK SENTIMENT ANALYSIS DASHBOARD
-# ============================================================
-#
+
 # Models:
 # 1. SVM + TF-IDF
 # 2. Bidirectional LSTM (BiLSTM)
